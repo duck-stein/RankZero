@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronLeft, ChevronRight, Flame, SkipForward, Swords, Timer, Zap } from 'lucide-react'
+import { ArrowRight, ChevronLeft, ChevronRight, FastForward, SkipForward, Swords, Timer, Users, X } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useSession } from '../context/SessionContext'
 import { useNow, useQuery, must } from '../lib/useQuery'
 import { flatExercises, getWorkouts } from '../lib/workouts'
 import { clock, damageOf, damageOfMinutes, fmt, fmt1, levelUnlocks, localDate, xpOf } from '../lib/rpg'
 import { Btn, Chip, Empty, ErrorNote, Loading, Panel, SegBar, SysHead } from '../components/ui'
+import { getTrainingBuddies } from '../lib/training'
 import { getBoss, getDailyMonster, getGlobalBoss, hitGlobalBoss, abandonDailyMonster, getRaidPartners, getRaidDamageByMember } from '../lib/data'
 import { INVOKABLE_BOSSES } from '../lib/rpg'
 
@@ -44,10 +45,7 @@ export default function Treinar({ go, params }) {
   if (!workout) {
     return (
       <div className="stack">
-        <Panel brackets>
-          <SysHead>[ESCOLHA SUA DUNGEON]</SysHead>
-          <p className="muted">Selecione a ficha de hoje para iniciar a sessão de combate.</p>
-        </Panel>
+        <SysHead>[QUAL FICHA HOJE?]</SysHead>
         {list.map((w) => {
           const n = flatExercises(w).length
           return (
@@ -96,8 +94,21 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
   const saved = useMemo(() => loadSessionState(stateKey), [stateKey])
 
   const now = useNow(500)
-  const exercises = useMemo(() => flatExercises(workout), [workout])
-  const [idx, setIdx] = useState(saved?.idx ?? 0)
+  const baseExercises = useMemo(() => flatExercises(workout), [workout])
+  // ordem da sessão: começa na ordem da ficha e muda quando o caçador pula um
+  // exercício (máquina ocupada) — o pulado vai pro fim da fila e volta depois.
+  // Reconcilia com a ficha atual caso ela tenha sido editada no meio do treino.
+  const [order, setOrder] = useState(() => {
+    const ids = baseExercises.map((e) => e.id)
+    const kept = (saved?.order || []).filter((id) => ids.includes(id))
+    return [...kept, ...ids.filter((id) => !kept.includes(id))]
+  })
+  const [skipped, setSkipped] = useState(saved?.skipped ?? {})
+  const exercises = useMemo(() => {
+    const byId = Object.fromEntries(baseExercises.map((e) => [e.id, e]))
+    return order.map((id) => byId[id]).filter(Boolean)
+  }, [order, baseExercises])
+  const [idx, setIdx] = useState(Math.min(saved?.idx ?? 0, Math.max(baseExercises.length - 1, 0)))
   const [done, setDone] = useState(saved?.done ?? {}) // exerciseId -> [{weight, reps, dmg}]
   const [saving, setSaving] = useState(false)
   const [restEnd, setRestEnd] = useState(saved?.restEnd ?? 0)
@@ -108,8 +119,8 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
   // persiste a sessão a cada mudança relevante, pra retomar de onde parou
   // se o caçador sair da tela (tela inicial, ficha, etc.) e voltar depois
   useEffect(() => {
-    localStorage.setItem(stateKey, JSON.stringify({ idx, done, restEnd, finished, startedAt: startedAt.current }))
-  }, [stateKey, idx, done, restEnd, finished])
+    localStorage.setItem(stateKey, JSON.stringify({ idx, done, restEnd, finished, order, skipped, startedAt: startedAt.current }))
+  }, [stateKey, idx, done, restEnd, finished, order, skipped])
 
   const clearSession = () => {
     try { localStorage.removeItem(stateKey) } catch { }
@@ -216,6 +227,9 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
       .catch(() => { if (!cancelled) setRaidMembers(null) })
     return () => { cancelled = true }
   }, [boss?.id, boss?.status, boss?.current_hp])
+
+  const [buddies, setBuddies] = useState([])
+  useEffect(() => { getTrainingBuddies(user.id).then(setBuddies).catch(() => { }) }, [user.id])
 
   const [daily, setDaily] = useState(null)
 
@@ -366,10 +380,11 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
 
   if (finished) {
     const mins = Math.max(1, Math.round((Date.now() - startedAt.current) / 60000))
+    const pending = exercises.filter((e) => !isExerciseDone(e, done)).length
     return (
       <div className="stack">
         <Panel brackets tone="gold">
-          <SysHead right="MISSÃO CUMPRIDA">[RELATÓRIO DA SESSÃO]</SysHead>
+          <SysHead right="MISSÃO CUMPRIDA">[RELATÓRIO]</SysHead>
           <h2 className="h-xl glow">{workout.title || `Ficha ${workout.letter}`} concluída</h2>
           <div className="grid3">
             <div className="reward"><b>{fmt(sessionDmg)}</b><span className="mono tiny dim">DANO (KG)</span></div>
@@ -377,6 +392,7 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
             <div className="reward"><b>{mins} min</b><span className="mono tiny dim">DURAÇÃO</span></div>
           </div>
           <p className="mono gold">+{fmt(sessionXp)} XP GRAVADO</p>
+          {pending > 0 && <p className="mono tiny dim">{pending} exercício(s) ficaram de fora hoje.</p>}
         </Panel>
         <Btn onClick={() => { clearSession(); onFinishAll ? onFinishAll() : onExit(); go('inicio') }}>Voltar ao início</Btn>
         <Btn variant="ghost" onClick={() => { clearSession(); onFinishAll ? onFinishAll() : onExit() }}>Treinar outra ficha</Btn>
@@ -387,83 +403,99 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
   if (!ex) return <Empty title="Ficha vazia" action={<Btn onClick={() => go('ficha')}>Adicionar exercícios</Btn>}>Esta ficha ainda não tem exercícios.</Empty>
 
   const next = exercises[idx + 1]
+  const isLast = !next
   const bossPct = boss ? Number(boss.current_hp) / Number(boss.max_hp) : 0
   const restActive = restLeft > 0
+  const targetSets = ex.target_sets || 3
+  const shownSet = Math.min(sets.length + 1, targetSets)
+  const canSkip = !isLast
+  const stripBoss = boss && boss.status === 'active' ? boss : null
+  const stripDaily = !stripBoss && daily && daily.status === 'active' ? daily : null
+  const buddyNames = buddies.map((b) => b.hunter_name || b.name).join(' e ')
+
+  const skip = () => {
+    if (!canSkip) return
+    setOrder((o) => [...o.slice(0, idx), ...o.slice(idx + 1), o[idx]])
+    setSkipped((m) => ({ ...m, [ex.id]: true }))
+    setRestEnd(0)
+    notify(`${ex.name} ficou pro final — volta quando a máquina liberar`)
+  }
+  const goNext = () => setIdx((i) => i + 1)
+  const lastTime = prev.length
+    ? (prev[0].duration_min != null ? `${fmt1(prev[prev.length - 1].duration_min)} min` : `${fmt1(prev[prev.length - 1].weight)} kg × ${prev[prev.length - 1].reps}`)
+    : null
+  const metaText = isCardioLivre ? 'Livre · sem tempo fixo' : isCardio ? `${targetMinutes} min` : `${targetSets} × ${targetReps}${targetWeight > 0 ? ` · ${fmt1(targetWeight)} kg` : ''}`
 
   return (
-    <div className="stack">
-      <div className="row between">
-        <button className="link mono tiny" onClick={onExit}><ChevronLeft size={12} /> TROCAR FICHA</button>
-        <span className="mono tiny dim">EXERCÍCIO {idx + 1} / {exercises.length}</span>
+    <div className="fit">
+      <div className="tr-top">
+        <button className="link mono tiny" onClick={onExit}><ChevronLeft size={12} /> FICHAS</button>
+        <div className="dots" role="tablist" aria-label="Exercícios da ficha">
+          {exercises.map((e, i) => {
+            const st = i === idx ? 'now' : isExerciseDone(e, done) ? 'done' : skipped[e.id] ? 'skip' : ''
+            return <button key={e.id} className={`dot-ex ${st}`} onClick={() => setIdx(i)} aria-label={`${i + 1}: ${e.name}`} aria-current={i === idx} />
+          })}
+        </div>
+        <span className="mono tiny dim">{idx + 1}/{exercises.length}</span>
       </div>
 
-      {boss && boss.status === 'active' && (
-        <Panel tone="red">
-          <div className="row between">
-            <Chip tone="red">{raidMembers ? 'RAID EM DUPLA ATIVA' : 'RAID ATIVA'}</Chip>
-            <span className="mono tiny dim">{Math.round(bossPct * 100)}% HP</span>
-          </div>
-          <h3 className="h-md">{boss.name}</h3>
-          <SegBar value={Number(boss.current_hp)} max={Number(boss.max_hp)} tone="gold" label="HP do chefe" />
-          {raidMembers && (
-            <div className="row gap wrap" style={{ marginTop: '0.5rem' }}>
-              {raidMembers.map((m) => {
-                const mine = m.userId === user.id
-                const label = m.profile?.hunter_name || m.profile?.name || 'Caçador'
-                return (
-                  <div key={m.userId} className="reward" style={{ flex: '1 1 auto' }}>
-                    <b className={mine ? 'cyan' : ''}>{fmt(m.damage)}</b>
-                    <span className="mono tiny dim">{label}{mine ? ' (VOCÊ)' : ''} · DANO</span>
-                  </div>
-                )
-              })}
+      {(stripBoss || stripDaily || buddies.length > 0) && (
+        <div className="tr-strip">
+          {stripBoss && (
+            <div className="strip-line">
+              <Chip tone="red">{raidMembers ? 'RAID DUPLA' : 'RAID'}</Chip>
+              <b className="clip">{stripBoss.name}</b>
+              <span className="mono tiny dim">{Math.round(bossPct * 100)}%</span>
             </div>
           )}
-        </Panel>
-      )}
-      {daily && daily.status === 'active' && (
-        <Panel tone="amber">
-          <div className="row between">
-            <Chip tone="amber">MONSTRO DO DIA</Chip>
-            <span className="mono tiny dim">
-              {Math.round((Number(daily.current_hp) / Number(daily.max_hp)) * 100)}% HP
-            </span>
-          </div>
-          <h3 className="h-md">{daily.name}</h3>
-          <p className="mono tiny dim">
-            NÍVEL {daily.boss_level || 1}
-            {daily.weak_vs && ` · FRACO CONTRA ${daily.weak_vs.toUpperCase()} (+${Math.round((Number(daily.bonus_mult || 1.2) - 1) * 100)}% DANO)`}
-          </p>
-          {daily.weak_vs && (
-            <p className="mono tiny gold">
-              {daily.weak_vs === profile.class
-                ? `Sua classe explora a fraqueza: dano x${daily.bonus_mult || 1.2}`
-                : 'Sua classe não é a fraqueza deste monstro: dano normal'}
+          {stripDaily && (
+            <div className="strip-line">
+              <Chip tone="amber">DIA</Chip>
+              <b className="clip">{stripDaily.name}</b>
+              <span className="mono tiny dim">{Math.round((Number(stripDaily.current_hp) / Number(stripDaily.max_hp)) * 100)}%</span>
+              <button className="icon-btn plain" disabled={leavingDaily} onClick={leaveDaily} aria-label="Sair da dungeon diária" title="Sair da dungeon diária"><X size={14} /></button>
+            </div>
+          )}
+          {(stripBoss || stripDaily) && (
+            <SegBar value={Number((stripBoss || stripDaily).current_hp)} max={Number((stripBoss || stripDaily).max_hp)} tone={stripBoss ? 'gold' : 'amber'} segments={20} label="HP" />
+          )}
+          {stripBoss && raidMembers && (
+            <p className="mono tiny dim clip">
+              {raidMembers.map((m) => `${m.userId === user.id ? 'VOCÊ' : (m.profile?.hunter_name || m.profile?.name || 'Caçador')} ${fmt(m.damage)}`).join('  ·  ')}
             </p>
           )}
-          <SegBar value={Number(daily.current_hp)} max={Number(daily.max_hp)} tone="amber" label="HP do monstro diário" />
-          <button className="link mono tiny" disabled={leavingDaily} onClick={leaveDaily}>
-            {leavingDaily ? 'SAINDO...' : 'SAIR DA DUNGEON DIÁRIA'}
-          </button>
-        </Panel>
+          {buddies.length > 0 && (
+            <p className="mono tiny gold clip"><Users size={11} style={{ verticalAlign: '-2px' }} /> TREINANDO JUNTO COM {buddyNames.toUpperCase()}</p>
+          )}
+        </div>
       )}
 
-      <Panel brackets>
-        <p className="mono tiny cyan">[{ex.machine}]</p>
-        <h2 className="h-xl">{ex.name}</h2>
-
-        <div className="info-row">
-          <Flame size={20} className="cyan" />
-          <div>
-            <p className="mono tiny dim">IMPACTO NA SESSÃO</p>
-            <p>Dano acumulado: <b className="cyan">+{fmt(sessionDmg)} DMG</b></p>
-          </div>
+      <Panel brackets className="tr-card">
+        <div className="tr-head">
+          <p className="mono tiny cyan clip">[{ex.machine}]{skipped[ex.id] && sets.length === 0 ? ' · PULADO ANTES' : ''}</p>
+          <h2 className="tr-name">{ex.name}</h2>
+          <p className="mono tiny dim">META {metaText}{lastTime ? ` · ÚLTIMA ${lastTime}` : ''} · <span className="gold">+{xpOf(previewDmg)} XP</span></p>
         </div>
 
-        <div className="info-row timer">
-          <Timer size={20} className="gold" />
+        {!(isCardio || isCardioLivre) && (
+          <div className="set-pips" aria-label={`Séries: ${sets.length} de ${targetSets}`}>
+            {Array.from({ length: Math.max(targetSets, sets.length) }, (_, i) => {
+              const d = sets[i]
+              const active = i === sets.length && !setsComplete
+              return (
+                <div key={i} className={`set-pip ${d ? 'done' : ''} ${active ? 'active' : ''}`}>
+                  <span className="mono tiny">SÉRIE {i + 1}</span>
+                  <b>{d ? `${fmt1(d.weight)}×${d.reps}` : active ? `${fmt1(targetWeight)}×${targetReps}` : '—'}</b>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        <div className={`rest ${restActive ? 'on' : ''}`}>
+          <Timer size={18} className="gold" />
           <div className="grow">
-            <p className="mono tiny dim">INTERVALO {restActive ? 'ATIVO' : 'LIVRE'}</p>
+            <p className="mono tiny dim">{restActive ? 'DESCANSO' : 'PRONTO PRA PRÓXIMA'}</p>
             <p className="timer-num">{restActive ? clock(restLeft).slice(3) : '00:00'}</p>
           </div>
           {restActive && (
@@ -474,118 +506,72 @@ function SessionView({ workout, onExit, onFinishAll, go }) {
           )}
         </div>
 
-        <p className="mono tiny cyan">
-          META: {isCardioLivre ? 'LIVRE · SEM TEMPO FIXO' : isCardio ? `${targetMinutes} MIN` : `${ex.target_sets || 3} × ${targetReps}${targetWeight > 0 ? ` · ${fmt1(targetWeight)} KG` : ''}`}
-        </p>
-        <p className="mono tiny dim">{(isCardio || isCardioLivre) ? 'SESSÃO' : 'SÉRIE'} {Math.min(sets.length + 1, ex.target_sets || 3)} · {fmt(sets.length)} CONCLUÍDA{sets.length === 1 ? '' : 'S'}</p>
-
-        <div className="sets" role="table" aria-label="Séries">
-          <div className="sets-head mono tiny" role="row">
-            <span>{(isCardio || isCardioLivre) ? 'SESSÃO' : 'SÉRIE'}</span><span>ANTERIOR</span><span>HOJE</span>
-          </div>
-          {Array.from({ length: rows }, (_, i) => {
-            const isDone = sets[i]
-            const isActive = i === sets.length && !setsComplete
-            const p = prev[i]
-            return (
-              <div key={i} className={`set-row ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}`} role="row">
-                <span className="n">{i + 1}</span>
-                <span className="mono tiny dim">{p ? (p.duration_min != null ? `${fmt1(p.duration_min)} min` : `${fmt1(p.weight)} kg × ${p.reps}`) : '—'}</span>
-                {isDone ? (
-                  <b>{isDone.minutes != null ? `${fmt1(isDone.minutes)} min` : `${fmt1(isDone.weight)} kg × ${isDone.reps}`}</b>
-                ) : isActive ? (
-                  <span className="mono">
-                    {isCardioLivre ? 'cronômetro livre' : isCardio ? `${fmt1(targetMinutes)} min` : `${fmt1(targetWeight)} kg × ${targetReps}`}
-                  </span>
-                ) : (
-                  <span className="dim">—</span>
-                )}
-              </div>
-            )
-          })}
-        </div>
-
-        <p className="mono tiny gold"><Zap size={12} style={{ verticalAlign: '-2px' }} /> Esta sessão vale +{xpOf(previewDmg)} XP · {fmt(previewDmg)} dano</p>
-
-        {isCardioLivre ? (
-          <>
-            <div className="info-row timer">
-              <Timer size={20} className="cyan" />
-              <div className="grow">
-                <p className="mono tiny dim">{stopwatch ? (stopwatch.running ? 'CRONÔMETRO ATIVO' : 'PAUSADO') : 'PARADO'}</p>
-                <p className="timer-num">{clock(stopwatchElapsedMs)}</p>
-              </div>
-            </div>
-            {!stopwatch && (
-              <Btn icon={Swords} className="cta" disabled={saving || restActive} onClick={startStopwatch}>
-                Iniciar
-              </Btn>
-            )}
-            {stopwatch && stopwatch.running && (
-              <div className="row gap">
-                <Btn variant="ghost" onClick={pauseStopwatch}>Pausar</Btn>
-                <Btn variant="danger" onClick={stopStopwatch} disabled={saving}>{saving ? 'Gravando...' : 'Parar & registrar'}</Btn>
-              </div>
-            )}
-            {stopwatch && !stopwatch.running && (
-              <div className="row gap">
-                <Btn onClick={resumeStopwatch}>Retomar</Btn>
-                <Btn variant="danger" onClick={stopStopwatch} disabled={saving}>{saving ? 'Gravando...' : 'Parar & registrar'}</Btn>
-              </div>
-            )}
-          </>
-        ) : isCardio ? (
-          <>
-            {timer && (
-              <div className="info-row timer">
-                <Timer size={20} className="cyan" />
+        <div className="tr-cta">
+          {isCardioLivre ? (
+            <>
+              <div className="rest on">
+                <Timer size={18} className="cyan" />
                 <div className="grow">
-                  <p className="mono tiny dim">{timer.running ? 'CRONÔMETRO ATIVO' : 'PAUSADO'}</p>
-                  <p className="timer-num">{clock(timerRemainingMs)}</p>
+                  <p className="mono tiny dim">{stopwatch ? (stopwatch.running ? 'CRONÔMETRO ATIVO' : 'PAUSADO') : 'PARADO'}</p>
+                  <p className="timer-num">{clock(stopwatchElapsedMs)}</p>
                 </div>
               </div>
-            )}
-            {!timer && (
-              <Btn icon={Swords} className="cta" disabled={saving || restActive} onClick={startTimer}>
-                Começar cardio ({targetMinutes} min)
-              </Btn>
-            )}
-            {timer && timer.running && (
-              <div className="row gap">
-                <Btn variant="ghost" onClick={pauseTimer}>Pausar</Btn>
-                <Btn variant="danger" onClick={cancelTimer}>Cancelar</Btn>
-              </div>
-            )}
-            {timer && !timer.running && (
-              <div className="row gap">
-                <Btn onClick={resumeTimer}>Retomar</Btn>
-                <Btn variant="danger" onClick={cancelTimer}>Cancelar</Btn>
-              </div>
-            )}
-          </>
-        ) : (
-          <Btn icon={Swords} className="cta" disabled={saving || restActive || setsComplete} onClick={complete}>
-            {saving ? 'Gravando...' : restActive ? 'Aguarde o intervalo...' : setsComplete ? 'Séries concluídas' : 'Concluir série & acumular atributos'}
-          </Btn>
-        )}
+              {!stopwatch && <Btn icon={Swords} className="cta" disabled={saving || restActive} onClick={startStopwatch}>Iniciar</Btn>}
+              {stopwatch && (
+                <div className="row gap">
+                  {stopwatch.running ? <Btn variant="ghost" onClick={pauseStopwatch}>Pausar</Btn> : <Btn onClick={resumeStopwatch}>Retomar</Btn>}
+                  <Btn variant="danger" onClick={stopStopwatch} disabled={saving}>{saving ? 'Gravando...' : 'Parar & registrar'}</Btn>
+                </div>
+              )}
+            </>
+          ) : isCardio ? (
+            <>
+              {timer && (
+                <div className="rest on">
+                  <Timer size={18} className="cyan" />
+                  <div className="grow">
+                    <p className="mono tiny dim">{timer.running ? 'CRONÔMETRO ATIVO' : 'PAUSADO'}</p>
+                    <p className="timer-num">{clock(timerRemainingMs)}</p>
+                  </div>
+                </div>
+              )}
+              {!timer && <Btn icon={Swords} className="cta" disabled={saving || restActive} onClick={startTimer}>Começar cardio ({targetMinutes} min)</Btn>}
+              {timer && (
+                <div className="row gap">
+                  {timer.running ? <Btn variant="ghost" onClick={pauseTimer}>Pausar</Btn> : <Btn onClick={resumeTimer}>Retomar</Btn>}
+                  <Btn variant="danger" onClick={cancelTimer}>Cancelar</Btn>
+                </div>
+              )}
+            </>
+          ) : setsComplete ? (
+            <Btn icon={isLast ? undefined : ArrowRight} className="cta" onClick={isLast ? () => setFinished(true) : goNext}>
+              {isLast ? 'Finalizar treino' : 'Próximo exercício'}
+            </Btn>
+          ) : (
+            <Btn icon={Swords} className="cta" disabled={saving || restActive} onClick={complete}>
+              {saving ? 'Gravando...' : restActive ? 'Descansando...' : `Concluir série ${shownSet}`}
+            </Btn>
+          )}
+        </div>
       </Panel>
 
-      <div className="row gap">
-        <Btn variant="ghost" disabled={idx === 0} onClick={() => setIdx((i) => i - 1)} icon={ChevronLeft}>Anterior</Btn>
-        {next ? (
-          <Btn variant="ghost" onClick={() => setIdx((i) => i + 1)}>Próximo</Btn>
+      <div className="tr-actions">
+        <Btn variant="ghost" disabled={idx === 0} onClick={() => setIdx((i) => i - 1)} aria-label="Exercício anterior"><ChevronLeft size={18} /></Btn>
+        <Btn variant="ghost" icon={FastForward} disabled={!canSkip} onClick={skip} title="Máquina ocupada? Deixa este pro final">
+          <span className="skip-label"><b>Pular exercício</b><small className="mono">MÁQUINA OCUPADA</small></span>
+        </Btn>
+        {isLast ? (
+          <Btn variant="ghost" onClick={() => setFinished(true)}>Encerrar</Btn>
         ) : (
-          <Btn variant="ghost" onClick={() => setFinished(true)}>Encerrar treino</Btn>
+          <Btn variant="ghost" onClick={goNext} aria-label="Próximo exercício"><ChevronRight size={18} /></Btn>
         )}
       </div>
-
-      {next && (
-        <Panel>
-          <p className="mono tiny dim">PRÓXIMO COMBO</p>
-          <p><b>{next.name}</b> <span className="mono tiny cyan">[{idx + 2}/{exercises.length}]</span></p>
-          <button className="link mono tiny" onClick={() => setFinished(true)}>ENCERRAR TREINO AGORA</button>
-        </Panel>
-      )}
     </div>
   )
+}
+
+// exercício concluído: séries completas (força) ou ao menos uma sessão (cardio)
+function isExerciseDone(e, done) {
+  const n = (done[e.id] || []).length
+  return e.kind === 'cardio' || e.kind === 'cardio_livre' ? n > 0 : n >= (e.target_sets || 3)
 }

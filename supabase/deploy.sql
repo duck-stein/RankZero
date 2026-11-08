@@ -280,6 +280,19 @@ create table if not exists public.friendships (
     unique (requester_id, addressee_id)
 );
 
+-- Convite para treinar junto (amigo vê "fulano quer treinar com você" e aceita/recusa)
+create table if not exists public.training_invites (
+    id uuid default uuid_generate_v4() primary key,
+    inviter_id uuid references public.profiles(id) on delete cascade not null,
+    invitee_id uuid references public.profiles(id) on delete cascade not null,
+    status text not null default 'pending' check (status in ('pending', 'accepted', 'declined')),
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+    responded_at timestamp with time zone,
+    check (inviter_id <> invitee_id)
+);
+create index if not exists idx_training_invites_invitee on public.training_invites (invitee_id, status, created_at desc);
+create index if not exists idx_training_invites_inviter on public.training_invites (inviter_id, status, created_at desc);
+
 -- Boss Global "Igris" (evento de servidor único, renovado manualmente/por
 -- ciclo — nunca tinha sido versionado, só existia no banco ao vivo)
 create table if not exists public.global_bosses (
@@ -654,6 +667,21 @@ create policy "Enviar convite (membro da guilda)" on public.guild_invites
   );
 drop policy if exists "Responder meu convite" on public.guild_invites;
 create policy "Responder meu convite" on public.guild_invites
+  for update to authenticated
+  using (auth.uid() = invitee_id)
+  with check (auth.uid() = invitee_id);
+
+alter table public.training_invites enable row level security;
+drop policy if exists "Ver meus convites de treino" on public.training_invites;
+create policy "Ver meus convites de treino" on public.training_invites
+  for select to authenticated
+  using (auth.uid() = invitee_id or auth.uid() = inviter_id);
+drop policy if exists "Enviar convite de treino" on public.training_invites;
+create policy "Enviar convite de treino" on public.training_invites
+  for insert to authenticated
+  with check (auth.uid() = inviter_id and inviter_id <> invitee_id);
+drop policy if exists "Responder convite de treino" on public.training_invites;
+create policy "Responder convite de treino" on public.training_invites
   for update to authenticated
   using (auth.uid() = invitee_id)
   with check (auth.uid() = invitee_id);
